@@ -6,13 +6,22 @@
 //   /usr/bin/osascript -l JavaScript helper/card.js '<json>'
 //   json:   { title?, question, options:[{label, detail?, recommended?}], at?: "notch"|"cursor",
 //             source?, timeout?: seconds, appearance?: "light"|"dark", companion?: {name, dir},
-//             debug?: true }        (tests also use at: "offscreen", a window on no display)
+//             session?: "<Claude Code session id>", debug?: true }
+//             (tests also use at: "offscreen", a window on no display)
 //   stdout: {"answer":"<label>","index":n} | {"answer":"<typed>","typed":true}
 //           | {"cancelled":true,"reason":"esc"|"timeout"}
 //
 // It draws one window, reads the pointer position and (with a companion) a few pictures from the
-// plugin's assets folder, prints the answer and exits. It makes no network requests, writes no
-// files, reads no environment, and needs no permissions.
+// plugin's assets folder, prints the answer and exits. It makes no network requests, reads no
+// environment, and needs no permissions.
+//
+// Coming to a pet: a card that knows its session can be called over to a spot on screen by another
+// app on this Mac (wallpap, whose pets play your Claude threads). While open it marks itself in
+// ~/.ask-notch/cards/<session>.json ({pid}; removed when it closes) and watches
+// ~/.ask-notch/anchor.json: {session, x, y, w, h, until} (a rect in screen points, origin
+// bottom-left; until = epoch ms). While that names its session and hasn't expired, the card slides
+// beside the rect; it stays put while the pointer is on it, then slides home. Those two files are
+// the only ones it reads or writes besides its own pictures.
 //
 // The card never takes the keyboard when it appears, so typing in another app can't answer it: the
 // window refuses to become the key window until you click it. Clicking an option answers. Clicking
@@ -22,11 +31,16 @@
 ObjC.import('AppKit')
 ObjC.import('QuartzCore')
 ObjC.import('stdlib')
+ObjC.import('CoreText')
 
-// Claude's design language: warm ivory / warm charcoal surfaces, terracotta accent, serif voice.
+// Wispr's design language (the Flow app): sand surfaces, near-black ink and buttons, white keycaps,
+// Figtree for UI and EB Garamond for the question, fathom green used once (the Recommended chip).
+// Tokens from relay/packages/wispr-theme (WisprTheme.swift / wispr.css).
 var PALETTES = {
-  light: { bg: 0xFAF9F5, raised: 0xF0EEE6, border: 0xE3E0D5, text: 0x141413, muted: 0x6B6A65, accent: 0xD97757 },
-  dark: { bg: 0x262624, raised: 0x30302E, border: 0x3E3E3A, text: 0xFAF9F5, muted: 0xA3A29C, accent: 0xD97757 },
+  light: { bg: 0xFCFCFB, raised: 0xF5F4F0, border: 0xEEEBE3, strong: 0xC5C0B3, text: 0x1A1A1A, muted: 0x5B5B59,
+    accent: 0x1A1A1A, onAccent: 0xFCFCFB, key: 0xFFFFFF, keyDrop: 0xD3CED6, rec: 0x034F46, recBg: 0xE2F5F2 },
+  dark: { bg: 0x1A1A1A, raised: 0x202020, border: 0x30302F, strong: 0x464544, text: 0xE9E8E1, muted: 0xB3B2AD,
+    accent: 0xFCFCFB, onAccent: 0x1A1A1A, key: 0x202020, keyDrop: 0x000000, rec: 0xE2F5F2, recBg: 0x034F46 },
 }
 var CARD_W = 440
 var PAD_X = 18, PAD_Y = 14, GAP = 12
@@ -37,8 +51,37 @@ function color(hex, alpha) {
     (hex & 255) / 255, alpha === undefined ? 1 : alpha)
 }
 
-function sysFont(size, weight) { return $.NSFont.systemFontOfSizeWeight(size, weight || 0) }
+// Figtree and EB Garamond ship in fonts/ next to helper/ (SIL OFL), registered for this process only;
+// Wispr Flow's own copies are the fallback, then the system faces.
+var FONTS_READY = (function () {
+  var fm = $.NSFileManager.defaultManager
+  var args = ObjC.deepUnwrap($.NSProcessInfo.processInfo.arguments) || []
+  var script = args.filter(function (a) { return /card\.js$/.test(a) })[0] || 'helper/card.js'
+  if (script[0] !== '/') script = fm.currentDirectoryPath.js + '/' + script
+  var dirs = [script.replace(/\/helper\/card\.js$/, '/fonts'), '/Applications/Wispr Flow.app/Contents/Resources/assets/fonts']
+  for (var i = 0; i < dirs.length; i++) {
+    var list = ObjC.deepUnwrap(fm.contentsOfDirectoryAtPathError(dirs[i], null)) || []
+    list.forEach(function (n) {
+      if (/^(Figtree|EBGaramond)[^/]*\.(ttf|otf)$/i.test(n)) $.CTFontManagerRegisterFontsForURL($.NSURL.fileURLWithPath(dirs[i] + '/' + n), 1, null)
+    })
+    if (!$.NSFont.fontWithNameSize('Figtree', 12).isNil()) return true
+  }
+  return false
+})()
+function sysFont(size, weight) {
+  var sys = $.NSFont.systemFontOfSizeWeight(size, weight || 0)
+  if (!FONTS_READY) return sys
+  var traits = $.NSMutableDictionary.dictionary
+  traits.setObjectForKey($.NSNumber.numberWithDouble(weight || 0), $.NSFontWeightTrait)
+  var a = $.NSMutableDictionary.dictionary
+  a.setObjectForKey($('Figtree'), $.NSFontFamilyAttribute)
+  a.setObjectForKey(traits, $.NSFontTraitsAttribute)
+  var f = $.NSFont.fontWithDescriptorSize($.NSFontDescriptor.fontDescriptorWithFontAttributes(a), size)
+  return f.isNil() ? sys : f
+}
 function serifFont(size) {
+  var g = $.NSFont.fontWithNameSize('EB Garamond', size)
+  if (!g.isNil()) return g
   var d = $.NSFont.systemFontOfSize(size).fontDescriptor.fontDescriptorWithDesign('NSCTFontUIFontDesignSerif')
   return d.isNil() ? $.NSFont.systemFontOfSize(size) : $.NSFont.fontWithDescriptorSize(d, size)
 }
@@ -82,10 +125,10 @@ function layoutCard(spec, dark) {
   var y = PAD_Y
 
   L.fonts = {
-    star: sysFont(13, W_BOLD), title: sysFont(11.5, W_MEDIUM), source: sysFont(10.5),
-    question: serifFont(16), label: sysFont(13, W_MEDIUM), badge: sysFont(11, W_SEMIBOLD),
-    rec: sysFont(9.5, W_MEDIUM), detail: sysFont(11.5), field: sysFont(12.5),
-    hintKey: sysFont(9.5, W_MEDIUM), hint: sysFont(10),
+    star: sysFont(13, W_BOLD), title: sysFont(12, W_SEMIBOLD), source: sysFont(11),
+    question: serifFont(19), label: sysFont(13.5, W_MEDIUM), badge: sysFont(11.5, W_SEMIBOLD),
+    rec: sysFont(10, W_MEDIUM), detail: sysFont(12), field: sysFont(13),
+    hintKey: sysFont(10, W_MEDIUM), hint: sysFont(10.5),
   }
   var F = L.fonts
 
@@ -122,10 +165,10 @@ function layoutCard(spec, dark) {
   y += L.field.h + GAP
 
   // Key hints.
-  var keyH = lineHeight(F.hintKey) + 2
+  var keyH = lineHeight(F.hintKey) + 4
   var hintH = Math.max(keyH, lineHeight(F.hint))
   var hx = PAD_X
-  var defs = [['click', 'for keys'], ['1–' + Math.max(1, opts.length), 'choose'], ['↵', 'confirm'], ['esc', 'dismiss']]
+  var defs = [['click', 'for keys'], ['1–' + Math.max(1, opts.length), 'choose'], ['↵', 'confirm'], ['esc', 'dismiss'], ['drag', 'move']]
   for (var k = 0; k < defs.length; k++) {
     var kw = px(textWidth(defs[k][0], attrs(F.hintKey))) + 8
     var tw = px(textWidth(defs[k][1], attrs(F.hint)))
@@ -179,21 +222,19 @@ function paintCard(spec, L, state, scale) {
   t.translateXByYBy(0, H); t.scaleXByYBy(1, -1); t.concat
   $.NSGraphicsContext.setCurrentContext($.NSGraphicsContext.graphicsContextWithCGContextFlipped(base.CGContext, true))
 
-  var card = cardPath(W, H, 12, 20)
+  var card = cardPath(W, H, 12, 12)
   fill(card, color(p.bg)); stroke(card, color(p.border))
 
   // Header.
   var hy = L.header.y, hh = L.header.h
-  var starA = attrs(F.star, color(p.accent))
-  var starW = px(textWidth('✻', starA))
-  drawText('✻', PAD_X, hy + (hh - lineHeight(F.star)) / 2, starW + 2, lineHeight(F.star), starA)
+  var starW = -6
   var srcW = 0
   if (L.header.source) {
     var sa = attrs(F.source, color(p.muted, 0.8))
     srcW = Math.min(Math.ceil(textWidth(L.header.source, sa)), 160)
     drawText(L.header.source, W - PAD_X - srcW, hy + (hh - lineHeight(F.source)) / 2, srcW, lineHeight(F.source), sa)
   }
-  var ta = attrs(F.title, color(p.muted))
+  var ta = attrs(F.title, color(p.text))
   var tx = PAD_X + starW + 6
   drawText(L.header.title, tx, hy + (hh - lineHeight(F.title)) / 2, W - PAD_X - tx - srcW - 8, lineHeight(F.title), ta)
 
@@ -205,14 +246,14 @@ function paintCard(spec, L, state, scale) {
   var opts = spec.options || []
   for (var i = 0; i < opts.length; i++) {
     var o = opts[i], r = L.rows[i], on = i === state.selected
-    var box = roundedRect(r.x, r.y, r.w, r.h, 11)
+    var box = roundedRect(r.x, r.y, r.w, r.h, 8)
     if (on) fill(box, color(p.raised))
-    stroke(box, on ? color(p.accent, 0.55) : color(p.border))
+    stroke(box, on ? color(p.strong) : color(p.border))
     var bx = r.x + 10, by = r.y + 8
     var badge = roundedRect(bx, by, 20, 20, 6)
-    fill(badge, on ? color(p.accent) : color(p.bg))
+    fill(badge, on ? color(p.accent) : color(p.key))
     if (!on) stroke(badge, color(p.border))
-    var na = attrs(F.badge, on ? $.NSColor.whiteColor : color(p.muted))
+    var na = attrs(F.badge, on ? color(p.onAccent) : color(p.muted))
     var nw = textWidth(String(i + 1), na), nh = lineHeight(F.badge)
     drawText(String(i + 1), bx + Math.ceil((20 - nw) - 0.5) / 2, by + Math.floor((20 - nh) / 2), nw + 2, nh, na)
     var cx = bx + 20 + 10
@@ -222,8 +263,8 @@ function paintCard(spec, L, state, scale) {
       var lw = Math.min(Math.ceil(textWidth(String(o.label), la)), r.labelW)
       var rh = lineHeight(F.rec) + 2
       var rx = cx + lw + 6, ry = by + (lineHeight(F.label) - rh) / 2
-      fill(roundedRect(rx, ry, r.recW, rh, rh / 2), color(p.accent, 0.12))
-      drawText('Recommended', rx + 5, ry + 1, r.recW, rh, attrs(F.rec, color(p.accent)))
+      fill(roundedRect(rx, ry, r.recW, rh, 6), color(p.recBg))
+      drawText('Recommended', rx + 5, ry + 1, r.recW, rh, attrs(F.rec, color(p.rec)))
     }
     if (o.detail) drawText(String(o.detail), cx, by + r.labelH + 2, r.w - 50, r.detailH + 2, attrs(F.detail, color(p.muted)))
   }
@@ -231,18 +272,21 @@ function paintCard(spec, L, state, scale) {
   // Text box, with its own placeholder (the system one is dimmed to near-invisible while the card
   // isn't key).
   var f = L.field
-  var fb = roundedRect(f.x, f.y, f.w, f.h, 10)
-  fill(fb, color(p.bg)); stroke(fb, color(p.border))
+  var fb = roundedRect(f.x, f.y, f.w, f.h, 8)
+  fill(fb, color(p.key)); stroke(fb, color(p.border))
   if (!state.typed) {
-    drawText('Something else? Type it here', f.x + 11, f.y + 8, f.w - 22, f.lineH, attrs(F.field, color(p.muted, 0.8)))
+    drawText('Something else? Type or say it', f.x + 11, f.y + 8, f.w - 22, f.lineH, attrs(F.field, color(p.muted, 0.8)))
   }
 
   // Key hints.
   for (var k = 0; k < L.hints.length; k++) {
     var hn = L.hints[k]
     var ky = L.hintY + (L.hintH - L.keyH) / 2
-    stroke(roundedRect(hn.x, ky, hn.kw, L.keyH, 4), color(p.border))
-    drawText(hn.key, hn.x + 4, ky + 1, hn.kw, L.keyH, attrs(F.hintKey, color(p.muted)))
+    // Wispr keycap: white, 1px border, a 2px drop below
+    fill(roundedRect(hn.x, ky + 1.5, hn.kw, L.keyH - 1, 4), color(p.keyDrop))
+    var cap = roundedRect(hn.x, ky, hn.kw, L.keyH - 1.5, 4)
+    fill(cap, color(p.key)); stroke(cap, color(p.border))
+    drawText(hn.key, hn.x + 4, ky + 1.5, hn.kw, L.keyH, attrs(F.hintKey, color(p.text)))
     drawText(hn.what, hn.x + hn.kw + 4, L.hintY + (L.hintH - lineHeight(F.hint)) / 2 - 0.5, hn.tw + 2, lineHeight(F.hint), attrs(F.hint, color(p.muted)))
   }
 
@@ -294,7 +338,9 @@ function loadCompanion(c) {
 }
 
 // ── output ──
+var OPEN_MARK = null
 function emit(obj) {
+  if (OPEN_MARK) $.NSFileManager.defaultManager.removeItemAtPathError($(OPEN_MARK), $())
   var s = $(JSON.stringify(obj) + '\n')
   $.NSFileHandle.fileHandleWithStandardOutput.writeData(s.dataUsingEncoding(4))
   $.exit(0)
@@ -312,6 +358,13 @@ function main(spec) {
   // accessory app (no Dock icon), which activates when you click it.
   var previous = $.NSWorkspace.sharedWorkspace.frontmostApplication
   app.setActivationPolicy(2)                    // prohibited (background-only)
+  // No menu bar means ⌘V/⌘C/⌘X/⌘A/⌘Z have no Edit menu to route through, so paste (and Wispr Flow
+  // dictation, which inserts by pasting) never reached the text box. A hidden Edit menu fixes both.
+  var mainMenu = $.NSMenu.alloc.init, holder = $.NSMenuItem.alloc.init, editMenu = $.NSMenu.alloc.initWithTitle('Edit')
+  mainMenu.addItem(holder); holder.submenu = editMenu
+  ;[['Undo', 'undo:', 'z'], ['Cut', 'cut:', 'x'], ['Copy', 'copy:', 'c'], ['Paste', 'paste:', 'v'], ['Select All', 'selectAll:', 'a']]
+    .forEach(function (d) { editMenu.addItem($.NSMenuItem.alloc.initWithTitleActionKeyEquivalent(d[0], d[1], d[2])) })
+  app.mainMenu = mainMenu
 
   var dark = spec.appearance ? spec.appearance === 'dark'
     : app.effectiveAppearance.bestMatchFromAppearancesWithNames($(['NSAppearanceNameAqua', 'NSAppearanceNameDarkAqua'])).js === 'NSAppearanceNameDarkAqua'
@@ -354,6 +407,14 @@ function main(spec) {
   } else {
     ox = sf.origin.x + sf.size.width / 2 - L.w / 2; oy = sf.origin.y + sf.size.height - winH
   }
+  // Drag the card anywhere and it opens there next time (~/.ask-notch/position.json); double-click it to snap
+  // back to the notch. A saved spot that is no longer on any screen is ignored.
+  var notch = { x: ox, y: oy }
+  if (spec.at !== 'cursor' && spec.at !== 'offscreen') {
+    var saved = onScreen(readPosition(), winW, winH)
+    if (saved) { ox = saved.x; oy = saved.y }
+  }
+  var home = { x: ox, y: oy }
   var scale = screen.backingScaleFactor || 2
 
   // The panel refuses to become key until it is clicked: macOS can't hand it the keyboard on its own.
@@ -449,6 +510,8 @@ function main(spec) {
   field.cell.scrollable = true
   content.addSubview(field)
   var fieldRect = { x: f.x, y: f.y, w: f.w, h: f.h }
+  $.NSNotificationCenter.defaultCenter.addObserverForNameObjectQueueUsingBlock(
+    'NSControlTextDidChangeNotification', field, $(), function () { try { syncPlaceholder() } catch (e) { log('card: ' + e) } })
 
   // Where an event lands, in card points (y down); null when outside the card.
   function at(ev) {
@@ -470,8 +533,11 @@ function main(spec) {
   function select(i) { if (i >= 0 && i !== state.selected) { state.selected = i; repaint() } }
   function hover(ev) { select(rowAt(at(ev))) }
   function fieldFocused() { return !field.currentEditor.isNil() }
+  // Our own placeholder is painted into the card, so it has to follow the text exactly: hide on the first
+  // character typed, pasted or dictated (Wispr pastes), back only when the box is empty again.
   function syncPlaceholder() {
-    var t = field.stringValue.js || ''
+    var ed = field.currentEditor
+    var t = (!ed.isNil() ? ed.string.js : field.stringValue.js) || ''
     if ((t === '') !== (state.typed === '')) { state.typed = t; repaint() } else state.typed = t
   }
   // Clicking the card is the user choosing it, so only then does it take the keyboard. macOS
@@ -485,11 +551,36 @@ function main(spec) {
     panel.makeKeyWindow
   }
 
-  var T = { down: 1, up: 2, key: 10 }
+  var T = { down: 1, up: 2, dragged: 6, key: 10 }
+  var drag = null
   function onEvent(ev) {
     var type = Number(ev.type)                       // the bridge hands enums over as strings
+    if (type === T.down && Number(ev.clickCount) === 2 && rowAt(at(ev)) < 0 && !inField(at(ev))) {
+      // double-click: back to the notch, and forget the saved spot
+      drag = null; home.x = notch.x; home.y = notch.y; forgetPosition()
+      panel.setFrameDisplayAnimate($.NSMakeRect(notch.x, notch.y, winW, winH), true, true)
+      return true
+    }
+    if (type === T.dragged && drag) {
+      var m = $.NSEvent.mouseLocation, dx = m.x - drag.mx, dy = m.y - drag.my
+      if (!drag.moved && Math.abs(dx) + Math.abs(dy) < 3) return true
+      if (drag.row >= 0) { state.pressed = -1; drag.row = -1 }       // a drag that starts on an option moves the card
+      drag.moved = true
+      panel.setFrameOrigin($.NSMakePoint(Math.round(drag.ox + dx), Math.round(drag.oy + dy)))
+      return true
+    }
+    if (type === T.up && drag) {
+      var d = drag; drag = null
+      if (d.moved) {
+        var fr = panel.frame; home.x = fr.origin.x; home.y = fr.origin.y
+        savePosition(home)
+        return true
+      }
+    }
     if (type === T.down) {
       var pt = at(ev), row = rowAt(pt)
+      if (pt && !inField(pt)) { var m0 = $.NSEvent.mouseLocation; drag = { mx: m0.x, my: m0.y, ox: panel.frame.origin.x, oy: panel.frame.origin.y, row: row, moved: false } }
+      if (spec.debug) log('down at ' + JSON.stringify(pt) + ' window=' + JSON.stringify([ev.locationInWindow.x, ev.locationInWindow.y]))
       if (row >= 0) { state.pressed = row; select(row); return true }   // one click answers (on release)
       if (!pt) return false
       state.wantField = inField(pt)
@@ -576,7 +667,95 @@ function main(spec) {
   var timeout = typeof spec.timeout === 'number' && spec.timeout > 0 ? spec.timeout : DEFAULT_TIMEOUT_S
   after(timeout, function () { emit({ cancelled: true, reason: 'timeout' }) })
 
+  // Answered elsewhere (the phone): a local file the mod's phone relay writes. Its answer is ours.
+  if (typeof spec.answerFile === 'string' && spec.answerFile.indexOf(ASK_DIR + '/answers/') === 0) {
+    $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(0.5, true, function () {
+      try {
+        var d = $.NSData.dataWithContentsOfFile($(spec.answerFile))
+        if (!d || d.isNil()) return
+        var a = JSON.parse($.NSString.alloc.initWithDataEncoding(d, 4).js)
+        $.NSFileManager.defaultManager.removeItemAtPathError($(spec.answerFile), $())
+        if (a && typeof a.answer === 'string' && a.answer) emit({ answer: a.answer, typed: !!a.typed, via: 'phone' })
+      } catch (e) { log('card: ' + e) }
+    })
+  }
+
+  if (typeof spec.session === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(spec.session) && spec.at !== 'offscreen') {
+    OPEN_MARK = markOpen(spec.session)
+    followAnchor(panel, spec.session, home, winW, winH)
+  }
+
   app.run
+}
+
+// ── coming to a pet (see the header) ──
+var ASK_DIR = $.NSHomeDirectory().js + '/.ask-notch'
+function markOpen(session) {
+  $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError($(ASK_DIR + '/cards'), true, $(), $())
+  var path = ASK_DIR + '/cards/' + session + '.json'
+  $(JSON.stringify({ pid: $.NSProcessInfo.processInfo.processIdentifier, t: Date.now() }))
+    .writeToFileAtomicallyEncodingError($(path), true, 4, $())
+  return path
+}
+function readPosition() {
+  var d = $.NSData.dataWithContentsOfFile($(ASK_DIR + '/position.json'))
+  if (!d || d.isNil()) return null
+  try { var p = JSON.parse($.NSString.alloc.initWithDataEncoding(d, 4).js); return isFinite(p.x) && isFinite(p.y) ? p : null } catch (e) { return null }
+}
+function savePosition(p) {
+  $.NSFileManager.defaultManager.createDirectoryAtPathWithIntermediateDirectoriesAttributesError($(ASK_DIR), true, $(), $())
+  $(JSON.stringify({ x: Math.round(p.x), y: Math.round(p.y) })).writeToFileAtomicallyEncodingError($(ASK_DIR + '/position.json'), true, 4, $())
+}
+function forgetPosition() { $.NSFileManager.defaultManager.removeItemAtPathError($(ASK_DIR + '/position.json'), $()) }
+// the saved spot, kept fully on the screen it is on; null if its centre is on no screen
+function onScreen(p, w, h) {
+  if (!p) return null
+  var screens = $.NSScreen.screens, cx = p.x + w / 2, cy = p.y + h / 2
+  for (var i = 0; i < screens.count; i++) {
+    var f = screens.objectAtIndex(i).frame
+    if (cx >= f.origin.x && cx < f.origin.x + f.size.width && cy >= f.origin.y && cy < f.origin.y + f.size.height) {
+      return { x: Math.min(Math.max(p.x, f.origin.x), f.origin.x + f.size.width - w), y: Math.min(Math.max(p.y, f.origin.y), f.origin.y + f.size.height - h) }
+    }
+  }
+  return null
+}
+function readAnchor() {
+  var d = $.NSData.dataWithContentsOfFile($(ASK_DIR + '/anchor.json'))
+  if (!d || d.isNil()) return null
+  try { return JSON.parse($.NSString.alloc.initWithDataEncoding(d, 4).js) } catch (e) { return null }
+}
+// Where the card goes beside a rect: to its right (left when there's no room), centred on it, kept on
+// the rect's screen.
+function besideRect(a, w, h) {
+  var cx = a.x + a.w / 2, cy = a.y + a.h / 2, screens = $.NSScreen.screens, vf = $.NSScreen.mainScreen.visibleFrame
+  for (var i = 0; i < screens.count; i++) {
+    var f = screens.objectAtIndex(i).frame
+    if (cx >= f.origin.x && cx < f.origin.x + f.size.width && cy >= f.origin.y && cy < f.origin.y + f.size.height) {
+      vf = screens.objectAtIndex(i).visibleFrame; break
+    }
+  }
+  var x = a.x + a.w + 12
+  if (x + w > vf.origin.x + vf.size.width - 8) x = a.x - 12 - w
+  var y = cy - h / 2
+  x = Math.min(Math.max(x, vf.origin.x + 8), vf.origin.x + vf.size.width - w - 8)
+  y = Math.min(Math.max(y, vf.origin.y + 8), vf.origin.y + vf.size.height - h - 8)
+  return { x: Math.round(x), y: Math.round(y) }
+}
+function followAnchor(panel, session, home, w, h) {
+  var away = false
+  $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(0.15, true, function () {
+    try {
+      var a = readAnchor(), fr = panel.frame, m = $.NSEvent.mouseLocation
+      var on = m.x >= fr.origin.x && m.x <= fr.origin.x + fr.size.width && m.y >= fr.origin.y && m.y <= fr.origin.y + fr.size.height
+      var want = a && a.session === session && Number(a.until) > Date.now() && [a.x, a.y, a.w, a.h].every(isFinite)
+        ? besideRect(a, w, h) : null
+      if (!want && away && on) return              // the pointer is on the card: it stays to be answered
+      var to = want || { x: home.x, y: home.y }
+      if (Math.abs(to.x - fr.origin.x) < 2 && Math.abs(to.y - fr.origin.y) < 2) return
+      away = !!want
+      panel.setFrameDisplayAnimate($.NSMakeRect(to.x, to.y, w, h), true, true)
+    } catch (e) { log('card: ' + e) }
+  })
 }
 
 function after(seconds, fn) {

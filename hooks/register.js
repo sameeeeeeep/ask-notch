@@ -74,22 +74,65 @@ export function register(on) {
 
     // Same shape as Claude Code's own dialog result: question text -> chosen label (or typed text).
     const answers = {}
+    let cwd = ''
+    try { cwd = await $.session.cwd() } catch {}
     for (const q of qs) {
+      // Relay (optional, ~/.ask-notch/relay.json): may mirror this card elsewhere (your phone) and,
+      // if it's answered there first, writes answerFile, which the card returns as its answer.
+      const phone = await startPhone($, q, cwd)
       const r = await showCard($, {
         title: q.header ? 'Claude asks · ' + q.header : undefined,
         question: q.question,
+        answerFile: phone ? phone.answerFile : undefined,
         options: (q.options || []).map((o) => ({
           label: String(o.label).replace(/\s*\(recommended\)\s*$/i, ''),
           detail: o.description,
           recommended: /\(recommended\)\s*$/i.test(String(o.label)),
         })),
       }, cfg)
+      if (phone) endPhone($, phone, r)
       // Dismissed, timed out, or the card failed: hand the whole question set to Claude Code's dialog.
       if (!r || r.cancelled || !r.answer) return next(e)
       answers[q.question] = r.answer
     }
     return { result: { questions: qs, answers } }
   })
+}
+
+// ── relay: answer the card from somewhere else (your phone) ──
+// Off unless ~/.ask-notch/relay.json names a command: {"command": ["/path/to/node", "/path/to/relay.mjs"]}.
+// For each card the mod runs `<command> --relay <json>` alongside it, with
+//   { key, answerFile, cwd, question, wait }
+// The relay may mirror the question anywhere; if it's answered there first, it writes
+// {"answer": "...", "typed": bool} to answerFile (always under ~/.ask-notch/answers/) and the card
+// returns that as its answer. When the card closes the mod runs `<command> --done <key> <how> <answer>`
+// (how: mac | phone | cancelled) so the relay can stop and tidy up.
+async function relayConfig($) {
+  try {
+    const r = await $.process.run(['/bin/sh', '-c', 'printf "%s\\n" "$HOME"; cat "$HOME/.ask-notch/relay.json" 2>/dev/null'], { timeoutMs: 3000 })
+    const [home, ...rest] = r.stdout.split('\n')
+    const cfg = JSON.parse(rest.join('\n') || 'null')
+    const command = cfg && Array.isArray(cfg.command) && cfg.command.length && cfg.command.every((s) => typeof s === 'string') ? cfg.command : null
+    return command && home ? { home: home.trim(), command } : null
+  } catch { return null }
+}
+async function startPhone($, q, cwd) {
+  const relay = await relayConfig($)
+  if (!relay) return null
+  try {
+    const key = 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+    const answerFile = relay.home + '/.ask-notch/answers/' + key + '.json'
+    const spec = { key, answerFile, cwd, question: q, wait: CARD_TIMEOUT_S }
+    // Not awaited: it lives as long as the card, and exits when the card is done.
+    $.process.run([...relay.command, '--relay', JSON.stringify(spec)], { timeoutMs: (CARD_TIMEOUT_S + 20) * 1000 }).catch(() => {})
+    return { key, answerFile, command: relay.command }
+  } catch { return null }
+}
+function endPhone($, phone, r) {
+  const how = !r || r.cancelled ? 'cancelled' : r.via === 'phone' ? 'phone' : 'mac'
+  try {
+    $.process.run([...phone.command, '--done', phone.key, how, String((r && r.answer) || '')], { timeoutMs: 15000 }).catch(() => {})
+  } catch {}
 }
 
 // The fixed words /notch has always taken: on, off, notch, cursor, companion cat|off, test.
@@ -134,13 +177,16 @@ async function loadCfg($) {
 
 async function showCard($, spec, cfg) {
   const companion = cfg.companion === 'cat' ? { name: 'cat', dir: 'assets/companion/cat' } : undefined
+  // The card names its session so an app on this Mac (wallpap's pets) can call it over (helper/card.js).
+  let session
+  try { session = await $.session.id() } catch {}
   $.ui.status('question waiting at the ' + cfg.at)
   try {
     // Always the same command: macOS's own osascript running this plugin's helper/card.js. The question
     // goes to it on standard input; its answer comes back on standard output. Nothing leaves the Mac.
     const r = await $.process.run(['/usr/bin/osascript', '-l', 'JavaScript', 'helper/card.js'], {
       cwd: $.plugin.root,
-      stdin: JSON.stringify({ ...spec, at: cfg.at, source: 'Claude Code', timeout: CARD_TIMEOUT_S, companion }),
+      stdin: JSON.stringify({ ...spec, at: cfg.at, source: 'Claude Code', timeout: CARD_TIMEOUT_S, companion, session }),
       timeoutMs: (CARD_TIMEOUT_S + 15) * 1000,
     })
     const line = r.stdout.trim().split('\n').pop()
