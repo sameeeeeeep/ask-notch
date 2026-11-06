@@ -92,8 +92,8 @@ as usual.
 
 ## What it does on your machine
 
-The mod is [`hooks/register.js`](hooks/register.js) (about 100 lines) and the card is
-[`helper/card.js`](helper/card.js) (about 600 lines). Both are plain JavaScript you can read; the
+The mod is [`hooks/register.js`](hooks/register.js) (about 200 lines) and the card is
+[`helper/card.js`](helper/card.js) (about 800 lines). Both are plain JavaScript you can read; the
 plugin ships no compiled code.
 
 - **Which tool it answers, and when.** It handles only Claude Code's `AskUserQuestion` tool, and
@@ -106,18 +106,23 @@ plugin ships no compiled code.
   macOS's built-in script runner; the plugin needs it because a Claude Code mod can only draw inside
   Claude Code's window, and the card has to appear at the Mac's notch. The question, its options,
   where to show the card and, if you turned one on, the companion's folder go to the card on its
-  **standard input** as one JSON object. It starts nothing else and runs no shell.
+  **standard input** as one JSON object. Before each card it also runs one fixed `/bin/sh` line that
+  prints `$HOME` and reads `~/.ask-notch/relay.json`, to see whether you set up a relay (below).
+  Without that file it starts nothing else.
 - **What the card does.** `helper/card.js` uses macOS's JavaScript bridge to AppKit to draw one
   window, reads the pointer position (for `/notch cursor`) and, with a companion, the pictures in
   `assets/companion/`. It prints your answer as one line of JSON and exits. It makes no network
-  requests, writes no files, reads no environment variables and needs no permissions. It refuses
+  requests, reads no environment variables and needs no permissions. The only files it touches are
+  in `~/.ask-notch/`: `position.json` (where you dragged the card), `cards/<session>.json` while it's
+  open and `anchor.json` (so an app such as wallpap's pets can call the card over), and, with a
+  relay, the one `answers/<key>.json` the relay writes. It refuses
   the keyboard until you click it, and appears without activating, so it can't take keystrokes
   meant for the app you're using.
 - **What it reads, and where it sends it.** It reads the question Claude is asking (part of your
   conversation) and sends it to exactly one place: the local `osascript` process above, on its
   standard input. The card prints your answer on standard output and exits, and the mod gives the
-  answer back to Claude. Nothing leaves your Mac: no network requests, no files written, no
-  credentials or environment variables read.
+  answer back to Claude. Ask Notch itself makes no network requests and reads no credentials. A
+  relay you add is your own program, and it can send the question wherever you point it.
 - **Standing in for a tool.** The mod answers `AskUserQuestion` in place of Claude Code's dialog
   only when you answer on the card; every other case calls through to Claude Code's own dialog.
 - **Settings in plain words.** `/notch` followed by words it doesn't recognise sends Claude one
@@ -131,12 +136,31 @@ plugin ships no compiled code.
 - **What it stores.** Only your `/notch` settings (on or off, notch or cursor, companion), in
   Claude Code's local storage for this plugin.
 
+### Answer from anywhere: relays (optional, off by default)
+
+Put a command in `~/.ask-notch/relay.json` and Ask Notch runs it beside every card, so the same
+question can be answered somewhere else, for example your phone:
+
+```json
+{ "command": ["/path/to/node", "/path/to/my-relay.mjs"] }
+```
+
+- When a card opens: `<command> --relay '<json>'`, where the JSON is
+  `{ key, answerFile, cwd, question, wait }`.
+- If it's answered elsewhere first, the relay writes `{"answer": "...", "typed": false}` to
+  `answerFile` (always under `~/.ask-notch/answers/`). The card closes and returns that answer, as
+  if you'd clicked it.
+- When the card closes, however that happened: `<command> --done <key> <mac|phone|cancelled> '<answer>'`.
+
+Delete the file to turn it off. The relay is your code, not part of this plugin.
+
 To list the mod's hooks and calls yourself, run `claude plugin validate` on this directory.
 
 ## Privacy
 
 Ask Notch collects nothing. The question, its options and your answer pass only between Claude Code
-and `osascript` running `helper/card.js` on your Mac. There is no network access, no analytics and
+and `osascript` running `helper/card.js` on your Mac, plus a relay if you add one in
+`~/.ask-notch/relay.json` (yours, and it sees the question). There is no network access, no analytics and
 no account. The only thing saved is your `/notch` settings (on or off, notch or cursor, companion),
 in Claude Code's local storage for this plugin; uninstalling the plugin removes it.
 

@@ -35,6 +35,43 @@ test('a picked card answers the question without Claude Code\'s dialog', async (
   expect(spec.companion).toBeUndefined()
 })
 
+test('a relay in ~/.ask-notch/relay.json runs beside the card and can answer it', async ($, on) => {
+  base(on)
+  const runs: string[][] = []
+  let stdin = ''
+  on('process.run', (_$, e) => {
+    runs.push(e.argv)
+    if (e.argv[0] === '/bin/sh') return { value: { exitCode: 0, stdout: '/Users/me\n{"command":["/bin/relay"]}\n', stderr: '' } }
+    if (e.argv[0] === '/usr/bin/osascript') { stdin = e.init?.stdin ?? ''; return { value: { exitCode: 0, stdout: '{"answer":"Compact","typed":false,"via":"phone"}\n', stderr: '' } } }
+    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+  })
+  on('tool.call', () => ({ result: 'DIALOG' }))
+  const r = await $.tool.call(ask as any)
+  expect((r.result as any).answers).toEqual({ 'Which layout?': 'Compact' })
+  const relay = runs.find((a) => a[0] === '/bin/relay' && a[1] === '--relay')!
+  const spec = JSON.parse(relay[2])
+  expect(spec.answerFile.startsWith('/Users/me/.ask-notch/answers/')).toBe(true)
+  expect(spec.question.question).toBe('Which layout?')
+  expect(JSON.parse(stdin).answerFile).toBe(spec.answerFile)
+  expect(runs.some((a) => a[0] === '/bin/relay' && a[1] === '--done' && a[3] === 'phone' && a[4] === 'Compact')).toBe(true)
+})
+
+test('no relay.json: nothing but the card runs', async ($, on) => {
+  base(on)
+  const runs: string[][] = []
+  let stdin = ''
+  on('process.run', (_$, e) => {
+    runs.push(e.argv)
+    if (e.argv[0] === '/bin/sh') return { value: { exitCode: 0, stdout: '/Users/me\n', stderr: '' } }
+    stdin = e.init?.stdin ?? ''
+    return { value: { exitCode: 0, stdout: '{"answer":"Compact","index":1}\n', stderr: '' } }
+  })
+  on('tool.call', () => ({ result: 'DIALOG' }))
+  await $.tool.call(ask as any)
+  expect(runs.filter((a) => a[0] !== '/bin/sh' && a[0] !== '/usr/bin/osascript')).toEqual([])
+  expect(JSON.parse(stdin).answerFile).toBeUndefined()
+})
+
 test('a typed answer is returned as typed', async ($, on) => {
   base(on)
   on('process.run', () => ({ value: { exitCode: 0, stdout: '{"answer":"Roomy, but denser","typed":true}\n', stderr: '' } }))
